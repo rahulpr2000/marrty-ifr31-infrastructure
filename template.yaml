@@ -90,6 +90,20 @@ Resources:
               AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
             Action: "kms:*"
             Resource: "*"
+          - Sid: AllowCloudWatchLogsAccess
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
           - Sid: AllowLambdaServiceAccess
             Effect: Allow
             Principal:
@@ -484,12 +498,8 @@ Resources:
             MetricName: SQLiRuleSetMetric
             SampledRequestsEnabled: true
 
-  # Associate WAF with API Gateway
-  WebACLAssociation:
-    Type: AWS::WAFv2::WebACLAssociation
-    Properties:
-      ResourceArn: !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/${MarrtyApi}/stages/${Environment}"
-      WebACLArn: !GetAtt WebACL.Arn
+  # Note: WAF WebACL Association to API Gateway stage is done
+  # post-deploy via CLI, since SAM manages the stage lifecycle:
 
   # =========================================================================
   # 7. IoT CORE — Thing, Certificate Policy, Topic Rules
@@ -528,7 +538,7 @@ Resources:
   IoTRecognizeRule:
     Type: AWS::IoT::TopicRule
     Properties:
-      RuleName: !Sub "${ProjectName}_recognize_rule_${Environment}"
+      RuleName: "marrty_ifr31_recognize_rule_dev"
       TopicRulePayload:
         RuleDisabled: false
         Sql: "SELECT *, topic(2) AS device_id FROM 'marrty/+/recognize'"
@@ -644,6 +654,8 @@ Resources:
                 - rekognition:IndexFaces
                 - rekognition:DeleteFaces
                 - rekognition:ListFaces
+                - rekognition:DescribeCollection
+                - rekognition:CreateCollection
               Resource: !Sub "arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/${ProjectName}-students-${Environment}"
             - Effect: Allow
               Action:

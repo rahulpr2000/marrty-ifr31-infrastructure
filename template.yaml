@@ -1,950 +1,3066 @@
-##############################################################################
-# Marrty IFR31 — Student Face Attendance System
-# AWS SAM / CloudFormation Template
-#
-# Holy Grace Polytechnic College, Mala
-# Department: Computer Engineering
-#
-# Architecture: Fully Serverless, Zero Trust, End-to-End Encrypted
-# Services: KMS, S3, DynamoDB, Rekognition, IoT Core, API Gateway,
-#           Cognito, WAF, CloudFront, Lambda
-##############################################################################
-
-AWSTemplateFormatVersion: "2010-09-09"
-Transform: AWS::Serverless-2016-10-31
-
-Description: >
-  Marrty IFR31 Infrastructure — Serverless student face attendance system
-  with Zero Trust security, KMS encryption, and IoT Core device integration.
-
-# ---------------------------------------------------------------------------
-# Parameters
-# ---------------------------------------------------------------------------
-Parameters:
-  Environment:
-    Type: String
-    Default: dev
-    AllowedValues: [dev, staging, prod]
-    Description: Deployment environment
-
-  ProjectName:
-    Type: String
-    Default: marrty-ifr31
-    Description: Base name for all resources
-
-  CollegeName:
-    Type: String
-    Default: "Holy Grace Polytechnic College Mala"
-    Description: College name for tagging
-
-  Department:
-    Type: String
-    Default: "Computer Engineering"
-    Description: Department name for tagging
-
-# ---------------------------------------------------------------------------
-# Global Lambda Settings
-# ---------------------------------------------------------------------------
-Globals:
-  Function:
-    Runtime: python3.12
-    Timeout: 30
-    MemorySize: 256
-    Architectures:
-      - arm64
-    Environment:
-      Variables:
-        ENVIRONMENT: !Ref Environment
-        PROJECT_NAME: !Ref ProjectName
-        STUDENTS_TABLE: !Ref StudentsTable
-        FACULTY_TABLE: !Ref FacultyTable
-        ATTENDANCE_TABLE: !Ref AttendanceTable
-        DEVICES_TABLE: !Ref DevicesTable
-        FACE_IMAGES_BUCKET: !Ref FaceImagesBucket
-        REKOGNITION_COLLECTION_ID: !Sub "${ProjectName}-students-${Environment}"
-        KMS_KEY_ID: !Ref MasterEncryptionKey
-    Tags:
-      Project: !Ref ProjectName
-      Environment: !Ref Environment
-      College: !Ref CollegeName
-
-# ---------------------------------------------------------------------------
-# Resources
-# ---------------------------------------------------------------------------
-Resources:
-
-  # =========================================================================
-  # 1. ENCRYPTION — AWS KMS Customer Managed Key
-  # =========================================================================
-
-  MasterEncryptionKey:
-    Type: AWS::KMS::Key
-    Properties:
-      Description: !Sub "Master encryption key for ${ProjectName} (${Environment})"
-      KeyPolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: AllowRootAccountFullAccess
-            Effect: Allow
-            Principal:
-              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
-            Action: "kms:*"
-            Resource: "*"
-          - Sid: AllowCloudWatchLogsAccess
-            Effect: Allow
-            Principal:
-              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
-            Action:
-              - kms:Encrypt
-              - kms:Decrypt
-              - kms:ReEncrypt*
-              - kms:GenerateDataKey*
-              - kms:DescribeKey
-            Resource: "*"
-            Condition:
-              ArnLike:
-                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
-          - Sid: AllowLambdaServiceAccess
-            Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action:
-              - kms:Decrypt
-              - kms:Encrypt
-              - kms:GenerateDataKey
-            Resource: "*"
-          - Sid: AllowS3ServiceAccess
-            Effect: Allow
-            Principal:
-              Service: s3.amazonaws.com
-            Action:
-              - kms:Decrypt
-              - kms:GenerateDataKey
-            Resource: "*"
-          - Sid: AllowDynamoDBServiceAccess
-            Effect: Allow
-            Principal:
-              Service: dynamodb.amazonaws.com
-            Action:
-              - kms:Decrypt
-              - kms:Encrypt
-              - kms:GenerateDataKey
-              - kms:DescribeKey
-            Resource: "*"
-      EnableKeyRotation: true
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  MasterEncryptionKeyAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: !Sub "alias/${ProjectName}-${Environment}"
-      TargetKeyId: !Ref MasterEncryptionKey
-
-  # =========================================================================
-  # 2. STORAGE — S3 Bucket (Face Images, KMS Encrypted)
-  # =========================================================================
-
-  FaceImagesBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "${ProjectName}-face-images-${Environment}-${AWS::AccountId}"
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref MasterEncryptionKey
-            BucketKeyEnabled: true
-      VersioningConfiguration:
-        Status: Enabled
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      LifecycleConfiguration:
-        Rules:
-          - Id: TransitionToIA
-            Status: Enabled
-            Transitions:
-              - TransitionInDays: 90
-                StorageClass: STANDARD_IA
-      CorsConfiguration:
-        CorsRules:
-          - AllowedHeaders: ["*"]
-            AllowedMethods: [GET, PUT, POST]
-            AllowedOrigins: ["*"]
-            MaxAge: 3600
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  FaceImagesBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref FaceImagesBucket
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: EnforceSSLOnly
-            Effect: Deny
-            Principal: "*"
-            Action: "s3:*"
-            Resource:
-              - !GetAtt FaceImagesBucket.Arn
-              - !Sub "${FaceImagesBucket.Arn}/*"
-            Condition:
-              Bool:
-                "aws:SecureTransport": "false"
-
-  # =========================================================================
-  # 3. DATABASE — DynamoDB Tables (KMS Encrypted)
-  # =========================================================================
-
-  StudentsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub "${ProjectName}-students-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref MasterEncryptionKey
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      AttributeDefinitions:
-        - AttributeName: student_id
-          AttributeType: S
-        - AttributeName: batch
-          AttributeType: S
-        - AttributeName: name
-          AttributeType: S
-      KeySchema:
-        - AttributeName: student_id
-          KeyType: HASH
-      GlobalSecondaryIndexes:
-        - IndexName: batch-index
-          KeySchema:
-            - AttributeName: batch
-              KeyType: HASH
-            - AttributeName: name
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  FacultyTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub "${ProjectName}-faculty-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref MasterEncryptionKey
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      AttributeDefinitions:
-        - AttributeName: faculty_id
-          AttributeType: S
-        - AttributeName: role
-          AttributeType: S
-        - AttributeName: name
-          AttributeType: S
-      KeySchema:
-        - AttributeName: faculty_id
-          KeyType: HASH
-      GlobalSecondaryIndexes:
-        - IndexName: role-index
-          KeySchema:
-            - AttributeName: role
-              KeyType: HASH
-            - AttributeName: name
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  AttendanceTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub "${ProjectName}-attendance-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref MasterEncryptionKey
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      AttributeDefinitions:
-        - AttributeName: person_id
-          AttributeType: S
-        - AttributeName: timestamp
-          AttributeType: S
-        - AttributeName: date
-          AttributeType: S
-        - AttributeName: batch
-          AttributeType: S
-      KeySchema:
-        - AttributeName: person_id
-          KeyType: HASH
-        - AttributeName: timestamp
-          KeyType: RANGE
-      GlobalSecondaryIndexes:
-        - IndexName: date-index
-          KeySchema:
-            - AttributeName: date
-              KeyType: HASH
-            - AttributeName: timestamp
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-        - IndexName: batch-date-index
-          KeySchema:
-            - AttributeName: batch
-              KeyType: HASH
-            - AttributeName: date
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  DevicesTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub "${ProjectName}-devices-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref MasterEncryptionKey
-      AttributeDefinitions:
-        - AttributeName: device_id
-          AttributeType: S
-      KeySchema:
-        - AttributeName: device_id
-          KeyType: HASH
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-
-  # =========================================================================
-  # 4. AUTHENTICATION — Cognito User Pool
-  # =========================================================================
-
-  UserPool:
-    Type: AWS::Cognito::UserPool
-    Properties:
-      UserPoolName: !Sub "${ProjectName}-users-${Environment}"
-      AutoVerifiedAttributes:
-        - email
-      UsernameAttributes:
-        - email
-      MfaConfiguration: OPTIONAL
-      EnabledMfas:
-        - SOFTWARE_TOKEN_MFA
-      Policies:
-        PasswordPolicy:
-          MinimumLength: 12
-          RequireUppercase: true
-          RequireLowercase: true
-          RequireNumbers: true
-          RequireSymbols: true
-      Schema:
-        - Name: name
-          AttributeDataType: String
-          Mutable: true
-          Required: true
-        - Name: role
-          AttributeDataType: String
-          Mutable: true
-      UserPoolAddOns:
-        AdvancedSecurityMode: ENFORCED
-      AccountRecoverySetting:
-        RecoveryMechanisms:
-          - Name: verified_email
-            Priority: 1
-
-  UserPoolClient:
-    Type: AWS::Cognito::UserPoolClient
-    Properties:
-      ClientName: !Sub "${ProjectName}-web-client-${Environment}"
-      UserPoolId: !Ref UserPool
-      GenerateSecret: false
-      ExplicitAuthFlows:
-        - ALLOW_USER_SRP_AUTH
-        - ALLOW_REFRESH_TOKEN_AUTH
-      PreventUserExistenceErrors: ENABLED
-      SupportedIdentityProviders:
-        - COGNITO
-      AllowedOAuthFlows:
-        - code
-      AllowedOAuthScopes:
-        - openid
-        - email
-        - profile
-      AllowedOAuthFlowsUserPoolClient: true
-      CallbackURLs:
-        - "http://localhost:3000/api/auth/callback"
-        - !Sub "https://${ProjectName}-${Environment}.amplifyapp.com/api/auth/callback"
-      LogoutURLs:
-        - "http://localhost:3000"
-        - !Sub "https://${ProjectName}-${Environment}.amplifyapp.com"
-
-  UserPoolDomain:
-    Type: AWS::Cognito::UserPoolDomain
-    Properties:
-      Domain: !Sub "${ProjectName}-${Environment}-${AWS::AccountId}"
-      UserPoolId: !Ref UserPool
-
-  # =========================================================================
-  # 5. API GATEWAY — REST API with Cognito Authorizer
-  # =========================================================================
-
-  MarrtyApi:
-    Type: AWS::Serverless::Api
-    Properties:
-      Name: !Sub "${ProjectName}-api-${Environment}"
-      StageName: !Ref Environment
-      TracingEnabled: true
-      Cors:
-        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
-        AllowHeaders: "'Content-Type,Authorization'"
-        AllowOrigin: "'*'"
-        MaxAge: "'600'"
-      Auth:
-        DefaultAuthorizer: CognitoAuthorizer
-        Authorizers:
-          CognitoAuthorizer:
-            UserPoolArn: !GetAtt UserPool.Arn
-        AddDefaultAuthorizerToCorsPreflight: false
-
-  # =========================================================================
-  # 6. WAF — Web Application Firewall
-  # =========================================================================
-
-  WebACL:
-    Type: AWS::WAFv2::WebACL
-    Properties:
-      Name: !Sub "${ProjectName}-waf-${Environment}"
-      Scope: REGIONAL
-      DefaultAction:
-        Allow: {}
-      VisibilityConfig:
-        CloudWatchMetricsEnabled: true
-        MetricName: !Sub "${ProjectName}-waf-metrics"
-        SampledRequestsEnabled: true
-      Rules:
-        # Rate limiting: 1000 requests per 5 minutes per IP
-        - Name: RateLimitRule
-          Priority: 1
-          Action:
-            Block: {}
-          Statement:
-            RateBasedStatement:
-              Limit: 1000
-              AggregateKeyType: IP
-          VisibilityConfig:
-            CloudWatchMetricsEnabled: true
-            MetricName: RateLimitMetric
-            SampledRequestsEnabled: true
-
-        # AWS Managed Rules: Common Rule Set (SQLi, XSS, etc.)
-        - Name: AWSManagedRulesCommonRuleSet
-          Priority: 2
-          OverrideAction:
-            None: {}
-          Statement:
-            ManagedRuleGroupStatement:
-              VendorName: AWS
-              Name: AWSManagedRulesCommonRuleSet
-          VisibilityConfig:
-            CloudWatchMetricsEnabled: true
-            MetricName: CommonRuleSetMetric
-            SampledRequestsEnabled: true
-
-        # AWS Managed Rules: Known Bad Inputs
-        - Name: AWSManagedRulesKnownBadInputsRuleSet
-          Priority: 3
-          OverrideAction:
-            None: {}
-          Statement:
-            ManagedRuleGroupStatement:
-              VendorName: AWS
-              Name: AWSManagedRulesKnownBadInputsRuleSet
-          VisibilityConfig:
-            CloudWatchMetricsEnabled: true
-            MetricName: KnownBadInputsMetric
-            SampledRequestsEnabled: true
-
-        # AWS Managed Rules: SQL Injection
-        - Name: AWSManagedRulesSQLiRuleSet
-          Priority: 4
-          OverrideAction:
-            None: {}
-          Statement:
-            ManagedRuleGroupStatement:
-              VendorName: AWS
-              Name: AWSManagedRulesSQLiRuleSet
-          VisibilityConfig:
-            CloudWatchMetricsEnabled: true
-            MetricName: SQLiRuleSetMetric
-            SampledRequestsEnabled: true
-
-  # Note: WAF WebACL Association to API Gateway stage is done
-  # post-deploy via CLI, since SAM manages the stage lifecycle:
-
-  # =========================================================================
-  # 7. IoT CORE — Thing, Certificate Policy, Topic Rules
-  # =========================================================================
-
-  IoTPolicy:
-    Type: AWS::IoT::Policy
-    Properties:
-      PolicyName: !Sub "${ProjectName}-device-policy-${Environment}"
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Action:
-              - iot:Connect
-            Resource:
-              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-*"
-          - Effect: Allow
-            Action:
-              - iot:Publish
-            Resource:
-              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/recognize"
-              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/status"
-          - Effect: Allow
-            Action:
-              - iot:Subscribe
-            Resource:
-              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/marrty/*/result"
-          - Effect: Allow
-            Action:
-              - iot:Receive
-            Resource:
-              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/result"
-
-  # IoT Rule: Route face recognition requests to Lambda
-  IoTRecognizeRule:
-    Type: AWS::IoT::TopicRule
-    Properties:
-      RuleName: "marrty_ifr31_recognize_rule_dev"
-      TopicRulePayload:
-        RuleDisabled: false
-        Sql: "SELECT *, topic(2) AS device_id FROM 'marrty/+/recognize'"
-        Actions:
-          - Lambda:
-              FunctionArn: !GetAtt RecognizeFaceFunction.Arn
-        ErrorAction:
-          CloudwatchLogs:
-            LogGroupName: !Sub "/aws/iot/${ProjectName}-errors-${Environment}"
-            RoleArn: !GetAtt IoTRuleRole.Arn
-
-  IoTRuleRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${ProjectName}-iot-rule-role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: iot.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: IoTRuleCloudWatchLogs
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/iot/*"
-
-  # Permission for IoT to invoke Lambda
-  RecognizeFunctionIoTPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref RecognizeFaceFunction
-      Action: lambda:InvokeFunction
-      Principal: iot.amazonaws.com
-      SourceArn: !GetAtt IoTRecognizeRule.Arn
-
-  # =========================================================================
-  # 8. LAMBDA FUNCTIONS
-  # =========================================================================
-
-  # --- Recognize Face (IoT Triggered) ---
-  RecognizeFaceFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-recognize-face-${Environment}"
-      Description: "Recognize face from IoT device, log attendance"
-      CodeUri: ../marrty-ifr31-recognize/src/
-      Handler: handler.lambda_handler
-      Timeout: 15
-      MemorySize: 512
-      Policies:
-        - Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action:
-                - rekognition:SearchFacesByImage
-              Resource: !Sub "arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/${ProjectName}-students-${Environment}"
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:Query
-              Resource:
-                - !GetAtt StudentsTable.Arn
-                - !Sub "${StudentsTable.Arn}/index/*"
-                - !GetAtt FacultyTable.Arn
-                - !Sub "${FacultyTable.Arn}/index/*"
-            - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-              Resource: !GetAtt AttendanceTable.Arn
-            - Effect: Allow
-              Action:
-                - iot:Publish
-              Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/result"
-            - Effect: Allow
-              Action:
-                - kms:Decrypt
-                - kms:Encrypt
-                - kms:GenerateDataKey
-              Resource: !GetAtt MasterEncryptionKey.Arn
-      Environment:
-        Variables:
-          IOT_ENDPOINT: !Sub "${ProjectName}-iot-endpoint"
-
-  # --- Enroll Face (API Gateway) ---
-  EnrollFaceFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-enroll-face-${Environment}"
-      Description: "Upload photos and index faces into Rekognition"
-      CodeUri: ../marrty-ifr31-enroll/src/
-      Handler: handler.lambda_handler
-      Timeout: 30
-      MemorySize: 512
-      Policies:
-        - Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action:
-                - s3:PutObject
-                - s3:GetObject
-                - s3:DeleteObject
-              Resource: !Sub "${FaceImagesBucket.Arn}/*"
-            - Effect: Allow
-              Action:
-                - rekognition:IndexFaces
-                - rekognition:DeleteFaces
-                - rekognition:ListFaces
-                - rekognition:DescribeCollection
-                - rekognition:CreateCollection
-              Resource: !Sub "arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/${ProjectName}-students-${Environment}"
-            - Effect: Allow
-              Action:
-                - dynamodb:UpdateItem
-                - dynamodb:GetItem
-              Resource:
-                - !GetAtt StudentsTable.Arn
-                - !GetAtt FacultyTable.Arn
-            - Effect: Allow
-              Action:
-                - kms:Decrypt
-                - kms:Encrypt
-                - kms:GenerateDataKey
-              Resource: !GetAtt MasterEncryptionKey.Arn
-      Events:
-        EnrollPhotos:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/enroll/{person_id}
-            Method: POST
-        DeleteFaces:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/enroll/{person_id}
-            Method: DELETE
-
-  # --- Student API (CRUD) ---
-  StudentApiFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-student-api-${Environment}"
-      Description: "Student CRUD operations"
-      CodeUri: ../marrty-ifr31-student-api/src/
-      Handler: handler.lambda_handler
-      Policies:
-        - Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-                - dynamodb:GetItem
-                - dynamodb:UpdateItem
-                - dynamodb:DeleteItem
-                - dynamodb:Query
-                - dynamodb:Scan
-              Resource:
-                - !GetAtt StudentsTable.Arn
-                - !Sub "${StudentsTable.Arn}/index/*"
-            - Effect: Allow
-              Action:
-                - kms:Decrypt
-                - kms:Encrypt
-                - kms:GenerateDataKey
-              Resource: !GetAtt MasterEncryptionKey.Arn
-      Events:
-        CreateStudent:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/students
-            Method: POST
-        ListStudents:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/students
-            Method: GET
-        GetStudent:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/students/{id}
-            Method: GET
-        UpdateStudent:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/students/{id}
-            Method: PUT
-        DeleteStudent:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/students/{id}
-            Method: DELETE
-
-  # --- Faculty API (CRUD) ---
-  FacultyApiFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-faculty-api-${Environment}"
-      Description: "Faculty CRUD operations"
-      CodeUri: ../marrty-ifr31-faculty-api/src/
-      Handler: handler.lambda_handler
-      Policies:
-        - Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-                - dynamodb:GetItem
-                - dynamodb:UpdateItem
-                - dynamodb:DeleteItem
-                - dynamodb:Query
-                - dynamodb:Scan
-              Resource:
-                - !GetAtt FacultyTable.Arn
-                - !Sub "${FacultyTable.Arn}/index/*"
-            - Effect: Allow
-              Action:
-                - kms:Decrypt
-                - kms:Encrypt
-                - kms:GenerateDataKey
-              Resource: !GetAtt MasterEncryptionKey.Arn
-      Events:
-        CreateFaculty:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/faculty
-            Method: POST
-        ListFaculty:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/faculty
-            Method: GET
-        GetFaculty:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/faculty/{id}
-            Method: GET
-        UpdateFaculty:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/faculty/{id}
-            Method: PUT
-        DeleteFaculty:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/faculty/{id}
-            Method: DELETE
-
-  # --- Attendance API (Query & Reports) ---
-  AttendanceApiFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-attendance-api-${Environment}"
-      Description: "Attendance query and reports"
-      CodeUri: ../marrty-ifr31-attendance/src/
-      Handler: handler.lambda_handler
-      Policies:
-        - Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:Query
-                - dynamodb:Scan
-              Resource:
-                - !GetAtt AttendanceTable.Arn
-                - !Sub "${AttendanceTable.Arn}/index/*"
-            - Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:Query
-              Resource:
-                - !GetAtt StudentsTable.Arn
-                - !Sub "${StudentsTable.Arn}/index/*"
-            - Effect: Allow
-              Action:
-                - kms:Decrypt
-                - kms:GenerateDataKey
-              Resource: !GetAtt MasterEncryptionKey.Arn
-      Events:
-        GetAttendance:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/attendance
-            Method: GET
-        GetAttendanceReport:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MarrtyApi
-            Path: /api/attendance/report
-            Method: GET
-
-  # =========================================================================
-  # 9. CLOUDWATCH LOG GROUPS (Encrypted)
-  # =========================================================================
-
-  RecognizeFaceLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-recognize-face-${Environment}"
-      RetentionInDays: 30
-      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
-
-  EnrollFaceLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-enroll-face-${Environment}"
-      RetentionInDays: 30
-      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
-
-  StudentApiLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-student-api-${Environment}"
-      RetentionInDays: 30
-      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
-
-  FacultyApiLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-faculty-api-${Environment}"
-      RetentionInDays: 30
-      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
-
-  AttendanceApiLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-attendance-api-${Environment}"
-      RetentionInDays: 30
-      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
-
-  IoTErrorLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/iot/${ProjectName}-errors-${Environment}"
-      RetentionInDays: 30
-
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
-Outputs:
-  # API
-  ApiUrl:
-    Description: API Gateway endpoint URL
-    Value: !Sub "https://${MarrtyApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
-
-  # Cognito
-  UserPoolId:
-    Description: Cognito User Pool ID
-    Value: !Ref UserPool
-  UserPoolClientId:
-    Description: Cognito User Pool Client ID
-    Value: !Ref UserPoolClient
-  CognitoDomain:
-    Description: Cognito hosted UI domain
-    Value: !Sub "${ProjectName}-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
-
-  # Storage
-  FaceImagesBucketName:
-    Description: S3 bucket for face images
-    Value: !Ref FaceImagesBucket
-  StudentsTableName:
-    Description: DynamoDB Students table
-    Value: !Ref StudentsTable
-  FacultyTableName:
-    Description: DynamoDB Faculty table
-    Value: !Ref FacultyTable
-  AttendanceTableName:
-    Description: DynamoDB Attendance table
-    Value: !Ref AttendanceTable
-  DevicesTableName:
-    Description: DynamoDB Devices table
-    Value: !Ref DevicesTable
-
-  # Security
-  KmsKeyArn:
-    Description: KMS encryption key ARN
-    Value: !GetAtt MasterEncryptionKey.Arn
-  WebACLArn:
-    Description: WAF Web ACL ARN
-    Value: !GetAtt WebACL.Arn
-
-  # IoT
-  IoTPolicyName:
-    Description: IoT device policy name
-    Value: !Ref IoTPolicy
-
-  # Rekognition
-  RekognitionCollectionId:
-    Description: Rekognition face collection ID
-    Value: !Sub "${ProjectName}-students-${Environment}"
+##############################################################################
+
+
+# Marrty IFR31  Student Face Attendance System
+
+
+# AWS SAM / CloudFormation Template
+
+
+#
+
+
+# Holy Grace Polytechnic College, Mala
+
+
+# Department: Computer Engineering
+
+
+#
+
+
+# Architecture: Fully Serverless, Zero Trust, End-to-End Encrypted
+
+
+# Services: KMS, S3, DynamoDB, Rekognition, IoT Core, API Gateway,
+
+
+#           Cognito, WAF, CloudFront, Lambda
+
+
+##############################################################################
+
+
+
+
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+
+Transform: AWS::Serverless-2016-10-31
+
+
+
+
+
+Description: >
+
+
+  Marrty IFR31 Infrastructure  Serverless student face attendance system
+
+
+  with Zero Trust security, KMS encryption, and IoT Core device integration.
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+
+# Parameters
+
+
+# ---------------------------------------------------------------------------
+
+
+Parameters:
+
+
+  Environment:
+
+
+    Type: String
+
+
+    Default: dev
+
+
+    AllowedValues: [dev, staging, prod]
+
+
+    Description: Deployment environment
+
+
+
+
+
+  ProjectName:
+
+
+    Type: String
+
+
+    Default: marrty-ifr31
+
+
+    Description: Base name for all resources
+
+
+
+
+
+  CollegeName:
+
+
+    Type: String
+
+
+    Default: "Holy Grace Polytechnic College Mala"
+
+
+    Description: College name for tagging
+
+
+
+
+
+  Department:
+
+
+    Type: String
+
+
+    Default: "Computer Engineering"
+
+
+    Description: Department name for tagging
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+
+# Global Lambda Settings
+
+
+# ---------------------------------------------------------------------------
+
+
+Globals:
+
+
+  Function:
+
+
+    Runtime: python3.12
+
+
+    Timeout: 30
+
+
+    MemorySize: 256
+
+
+    Architectures:
+
+
+      - arm64
+
+
+    Environment:
+
+
+      Variables:
+
+
+        ENVIRONMENT: !Ref Environment
+
+
+        PROJECT_NAME: !Ref ProjectName
+
+
+        STUDENTS_TABLE: !Ref StudentsTable
+
+
+        FACULTY_TABLE: !Ref FacultyTable
+
+
+        ATTENDANCE_TABLE: !Ref AttendanceTable
+
+
+        DEVICES_TABLE: !Ref DevicesTable
+
+
+        FACE_IMAGES_BUCKET: !Ref FaceImagesBucket
+
+
+        REKOGNITION_COLLECTION_ID: !Sub "${ProjectName}-students-${Environment}"
+
+
+        KMS_KEY_ID: !Ref MasterEncryptionKey
+
+
+    Tags:
+
+
+      Project: !Ref ProjectName
+
+
+      Environment: !Ref Environment
+
+
+      College: !Ref CollegeName
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+
+# Resources
+
+
+# ---------------------------------------------------------------------------
+
+
+Resources:
+
+
+
+
+
+  # =========================================================================
+
+
+  # 1. ENCRYPTION  AWS KMS Customer Managed Key
+
+
+  # =========================================================================
+
+
+
+
+
+  MasterEncryptionKey:
+
+
+    Type: AWS::KMS::Key
+
+
+    Properties:
+
+
+      Description: !Sub "Master encryption key for ${ProjectName} (${Environment})"
+
+
+      KeyPolicy:
+
+
+        Version: "2012-10-17"
+
+
+        Statement:
+
+
+          - Sid: AllowRootAccountFullAccess
+
+
+            Effect: Allow
+
+
+            Principal:
+
+
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+
+
+            Action: "kms:*"
+
+
+            Resource: "*"
+
+
+          - Sid: AllowCloudWatchLogsAccess
+
+
+            Effect: Allow
+
+
+            Principal:
+
+
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+
+
+            Action:
+
+
+              - kms:Encrypt
+
+
+              - kms:Decrypt
+
+
+              - kms:ReEncrypt*
+
+
+              - kms:GenerateDataKey*
+
+
+              - kms:DescribeKey
+
+
+            Resource: "*"
+
+
+            Condition:
+
+
+              ArnLike:
+
+
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+
+          - Sid: AllowLambdaServiceAccess
+
+
+            Effect: Allow
+
+
+            Principal:
+
+
+              Service: lambda.amazonaws.com
+
+
+            Action:
+
+
+              - kms:Decrypt
+
+
+              - kms:Encrypt
+
+
+              - kms:GenerateDataKey
+
+
+            Resource: "*"
+
+
+          - Sid: AllowS3ServiceAccess
+
+
+            Effect: Allow
+
+
+            Principal:
+
+
+              Service: s3.amazonaws.com
+
+
+            Action:
+
+
+              - kms:Decrypt
+
+
+              - kms:GenerateDataKey
+
+
+            Resource: "*"
+
+
+          - Sid: AllowDynamoDBServiceAccess
+
+
+            Effect: Allow
+
+
+            Principal:
+
+
+              Service: dynamodb.amazonaws.com
+
+
+            Action:
+
+
+              - kms:Decrypt
+
+
+              - kms:Encrypt
+
+
+              - kms:GenerateDataKey
+
+
+              - kms:DescribeKey
+
+
+            Resource: "*"
+
+
+      EnableKeyRotation: true
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  MasterEncryptionKeyAlias:
+
+
+    Type: AWS::KMS::Alias
+
+
+    Properties:
+
+
+      AliasName: !Sub "alias/${ProjectName}-${Environment}"
+
+
+      TargetKeyId: !Ref MasterEncryptionKey
+
+
+
+
+
+  # =========================================================================
+
+
+  # 2. STORAGE  S3 Bucket (Face Images, KMS Encrypted)
+
+
+  # =========================================================================
+
+
+
+
+
+  FaceImagesBucket:
+
+
+    Type: AWS::S3::Bucket
+
+
+    Properties:
+
+
+      BucketName: !Sub "${ProjectName}-face-images-${Environment}-${AWS::AccountId}"
+
+
+      BucketEncryption:
+
+
+        ServerSideEncryptionConfiguration:
+
+
+          - ServerSideEncryptionByDefault:
+
+
+              SSEAlgorithm: aws:kms
+
+
+              KMSMasterKeyID: !Ref MasterEncryptionKey
+
+
+            BucketKeyEnabled: true
+
+
+      VersioningConfiguration:
+
+
+        Status: Enabled
+
+
+      PublicAccessBlockConfiguration:
+
+
+        BlockPublicAcls: true
+
+
+        BlockPublicPolicy: true
+
+
+        IgnorePublicAcls: true
+
+
+        RestrictPublicBuckets: true
+
+
+      LifecycleConfiguration:
+
+
+        Rules:
+
+
+          - Id: TransitionToIA
+
+
+            Status: Enabled
+
+
+            Transitions:
+
+
+              - TransitionInDays: 90
+
+
+                StorageClass: STANDARD_IA
+
+
+      CorsConfiguration:
+
+
+        CorsRules:
+
+
+          - AllowedHeaders: ["*"]
+
+
+            AllowedMethods: [GET, PUT, POST]
+
+
+            AllowedOrigins: ["*"]
+
+
+            MaxAge: 3600
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  FaceImagesBucketPolicy:
+
+
+    Type: AWS::S3::BucketPolicy
+
+
+    Properties:
+
+
+      Bucket: !Ref FaceImagesBucket
+
+
+      PolicyDocument:
+
+
+        Version: "2012-10-17"
+
+
+        Statement:
+
+
+          - Sid: EnforceSSLOnly
+
+
+            Effect: Deny
+
+
+            Principal: "*"
+
+
+            Action: "s3:*"
+
+
+            Resource:
+
+
+              - !GetAtt FaceImagesBucket.Arn
+
+
+              - !Sub "${FaceImagesBucket.Arn}/*"
+
+
+            Condition:
+
+
+              Bool:
+
+
+                "aws:SecureTransport": "false"
+
+
+
+
+
+  # =========================================================================
+
+
+  # 3. DATABASE  DynamoDB Tables (KMS Encrypted)
+
+
+  # =========================================================================
+
+
+
+
+
+  StudentsTable:
+
+
+    Type: AWS::DynamoDB::Table
+
+
+    Properties:
+
+
+      TableName: !Sub "${ProjectName}-students-${Environment}"
+
+
+      BillingMode: PAY_PER_REQUEST
+
+
+      SSESpecification:
+
+
+        SSEEnabled: true
+
+
+        SSEType: KMS
+
+
+        KMSMasterKeyId: !Ref MasterEncryptionKey
+
+
+      PointInTimeRecoverySpecification:
+
+
+        PointInTimeRecoveryEnabled: true
+
+
+      AttributeDefinitions:
+
+
+        - AttributeName: student_id
+
+
+          AttributeType: S
+
+
+        - AttributeName: batch
+
+
+          AttributeType: S
+
+
+        - AttributeName: name
+
+
+          AttributeType: S
+
+
+      KeySchema:
+
+
+        - AttributeName: student_id
+
+
+          KeyType: HASH
+
+
+      GlobalSecondaryIndexes:
+
+
+        - IndexName: batch-index
+
+
+          KeySchema:
+
+
+            - AttributeName: batch
+
+
+              KeyType: HASH
+
+
+            - AttributeName: name
+
+
+              KeyType: RANGE
+
+
+          Projection:
+
+
+            ProjectionType: ALL
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  FacultyTable:
+
+
+    Type: AWS::DynamoDB::Table
+
+
+    Properties:
+
+
+      TableName: !Sub "${ProjectName}-faculty-${Environment}"
+
+
+      BillingMode: PAY_PER_REQUEST
+
+
+      SSESpecification:
+
+
+        SSEEnabled: true
+
+
+        SSEType: KMS
+
+
+        KMSMasterKeyId: !Ref MasterEncryptionKey
+
+
+      PointInTimeRecoverySpecification:
+
+
+        PointInTimeRecoveryEnabled: true
+
+
+      AttributeDefinitions:
+
+
+        - AttributeName: faculty_id
+
+
+          AttributeType: S
+
+
+        - AttributeName: role
+
+
+          AttributeType: S
+
+
+        - AttributeName: name
+
+
+          AttributeType: S
+
+
+      KeySchema:
+
+
+        - AttributeName: faculty_id
+
+
+          KeyType: HASH
+
+
+      GlobalSecondaryIndexes:
+
+
+        - IndexName: role-index
+
+
+          KeySchema:
+
+
+            - AttributeName: role
+
+
+              KeyType: HASH
+
+
+            - AttributeName: name
+
+
+              KeyType: RANGE
+
+
+          Projection:
+
+
+            ProjectionType: ALL
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  AttendanceTable:
+
+
+    Type: AWS::DynamoDB::Table
+
+
+    Properties:
+
+
+      TableName: !Sub "${ProjectName}-attendance-${Environment}"
+
+
+      BillingMode: PAY_PER_REQUEST
+
+
+      SSESpecification:
+
+
+        SSEEnabled: true
+
+
+        SSEType: KMS
+
+
+        KMSMasterKeyId: !Ref MasterEncryptionKey
+
+
+      PointInTimeRecoverySpecification:
+
+
+        PointInTimeRecoveryEnabled: true
+
+
+      AttributeDefinitions:
+
+
+        - AttributeName: person_id
+
+
+          AttributeType: S
+
+
+        - AttributeName: timestamp
+
+
+          AttributeType: S
+
+
+        - AttributeName: date
+
+
+          AttributeType: S
+
+
+        - AttributeName: batch
+
+
+          AttributeType: S
+
+
+      KeySchema:
+
+
+        - AttributeName: person_id
+
+
+          KeyType: HASH
+
+
+        - AttributeName: timestamp
+
+
+          KeyType: RANGE
+
+
+      GlobalSecondaryIndexes:
+
+
+        - IndexName: date-index
+
+
+          KeySchema:
+
+
+            - AttributeName: date
+
+
+              KeyType: HASH
+
+
+            - AttributeName: timestamp
+
+
+              KeyType: RANGE
+
+
+          Projection:
+
+
+            ProjectionType: ALL
+
+
+        - IndexName: batch-date-index
+
+
+          KeySchema:
+
+
+            - AttributeName: batch
+
+
+              KeyType: HASH
+
+
+            - AttributeName: date
+
+
+              KeyType: RANGE
+
+
+          Projection:
+
+
+            ProjectionType: ALL
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  DevicesTable:
+
+
+    Type: AWS::DynamoDB::Table
+
+
+    Properties:
+
+
+      TableName: !Sub "${ProjectName}-devices-${Environment}"
+
+
+      BillingMode: PAY_PER_REQUEST
+
+
+      SSESpecification:
+
+
+        SSEEnabled: true
+
+
+        SSEType: KMS
+
+
+        KMSMasterKeyId: !Ref MasterEncryptionKey
+
+
+      AttributeDefinitions:
+
+
+        - AttributeName: device_id
+
+
+          AttributeType: S
+
+
+      KeySchema:
+
+
+        - AttributeName: device_id
+
+
+          KeyType: HASH
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  # =========================================================================
+
+
+  # 4. AUTHENTICATION  Cognito User Pool
+
+
+  # =========================================================================
+
+
+
+
+
+  UserPool:
+
+
+    Type: AWS::Cognito::UserPool
+
+
+    Properties:
+
+
+      UserPoolName: !Sub "${ProjectName}-users-${Environment}"
+
+
+      AutoVerifiedAttributes:
+
+
+        - email
+
+
+      UsernameAttributes:
+
+
+        - email
+
+
+      MfaConfiguration: OPTIONAL
+
+
+      EnabledMfas:
+
+
+        - SOFTWARE_TOKEN_MFA
+
+
+      Policies:
+
+
+        PasswordPolicy:
+
+
+          MinimumLength: 12
+
+
+          RequireUppercase: true
+
+
+          RequireLowercase: true
+
+
+          RequireNumbers: true
+
+
+          RequireSymbols: true
+
+
+      Schema:
+
+
+        - Name: name
+
+
+          AttributeDataType: String
+
+
+          Mutable: true
+
+
+          Required: true
+
+
+        - Name: role
+
+
+          AttributeDataType: String
+
+
+          Mutable: true
+
+
+      UserPoolAddOns:
+
+
+        AdvancedSecurityMode: ENFORCED
+
+
+      AccountRecoverySetting:
+
+
+        RecoveryMechanisms:
+
+
+          - Name: verified_email
+
+
+            Priority: 1
+
+
+
+
+
+  UserPoolClient:
+
+
+    Type: AWS::Cognito::UserPoolClient
+
+
+    Properties:
+
+
+      ClientName: !Sub "${ProjectName}-web-client-${Environment}"
+
+
+      UserPoolId: !Ref UserPool
+
+
+      GenerateSecret: false
+
+
+      ExplicitAuthFlows:
+
+
+        - ALLOW_USER_SRP_AUTH
+
+
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+
+      PreventUserExistenceErrors: ENABLED
+
+
+      SupportedIdentityProviders:
+
+
+        - COGNITO
+
+
+      AllowedOAuthFlows:
+
+
+        - code
+
+
+      AllowedOAuthScopes:
+
+
+        - openid
+
+
+        - email
+
+
+        - profile
+
+
+      AllowedOAuthFlowsUserPoolClient: true
+
+
+      CallbackURLs:
+
+
+        - "http://localhost:3000/api/auth/callback"
+
+
+        - !Sub "https://${ProjectName}-${Environment}.amplifyapp.com/api/auth/callback"
+
+
+      LogoutURLs:
+
+
+        - "http://localhost:3000"
+
+
+        - !Sub "https://${ProjectName}-${Environment}.amplifyapp.com"
+
+
+
+
+
+  UserPoolDomain:
+
+
+    Type: AWS::Cognito::UserPoolDomain
+
+
+    Properties:
+
+
+      Domain: !Sub "${ProjectName}-${Environment}-${AWS::AccountId}"
+
+
+      UserPoolId: !Ref UserPool
+
+
+
+
+
+  # =========================================================================
+
+
+  # 5. API GATEWAY  REST API with Cognito Authorizer
+
+
+  # =========================================================================
+
+
+
+
+
+  MarrtyApi:
+
+
+    Type: AWS::Serverless::Api
+
+
+    Properties:
+
+
+      Name: !Sub "${ProjectName}-api-${Environment}"
+
+
+      StageName: !Ref Environment
+
+
+      TracingEnabled: true
+
+
+      Cors:
+
+
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+
+        AllowHeaders: "'Content-Type,Authorization'"
+
+
+        AllowOrigin: "'*'"
+
+
+        MaxAge: "'600'"
+
+
+      Auth:
+
+
+        DefaultAuthorizer: CognitoAuthorizer
+
+
+        Authorizers:
+
+
+          CognitoAuthorizer:
+
+
+            UserPoolArn: !GetAtt UserPool.Arn
+
+
+        AddDefaultAuthorizerToCorsPreflight: false
+
+
+
+
+
+  # =========================================================================
+
+
+  # 6. WAF  Web Application Firewall
+
+
+  # =========================================================================
+
+
+
+
+
+  WebACL:
+
+
+    Type: AWS::WAFv2::WebACL
+
+
+    Properties:
+
+
+      Name: !Sub "${ProjectName}-waf-${Environment}"
+
+
+      Scope: REGIONAL
+
+
+      DefaultAction:
+
+
+        Allow: {}
+
+
+      VisibilityConfig:
+
+
+        CloudWatchMetricsEnabled: true
+
+
+        MetricName: !Sub "${ProjectName}-waf-metrics"
+
+
+        SampledRequestsEnabled: true
+
+
+      Rules:
+
+
+        # Rate limiting: 1000 requests per 5 minutes per IP
+
+
+        - Name: RateLimitRule
+
+
+          Priority: 1
+
+
+          Action:
+
+
+            Block: {}
+
+
+          Statement:
+
+
+            RateBasedStatement:
+
+
+              Limit: 1000
+
+
+              AggregateKeyType: IP
+
+
+          VisibilityConfig:
+
+
+            CloudWatchMetricsEnabled: true
+
+
+            MetricName: RateLimitMetric
+
+
+            SampledRequestsEnabled: true
+
+
+
+
+
+        # AWS Managed Rules: Common Rule Set (SQLi, XSS, etc.)
+
+
+        - Name: AWSManagedRulesCommonRuleSet
+
+
+          Priority: 2
+
+
+          OverrideAction:
+
+
+            None: {}
+
+
+          Statement:
+
+
+            ManagedRuleGroupStatement:
+
+
+              VendorName: AWS
+
+
+              Name: AWSManagedRulesCommonRuleSet
+
+
+          VisibilityConfig:
+
+
+            CloudWatchMetricsEnabled: true
+
+
+            MetricName: CommonRuleSetMetric
+
+
+            SampledRequestsEnabled: true
+
+
+
+
+
+        # AWS Managed Rules: Known Bad Inputs
+
+
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+
+
+          Priority: 3
+
+
+          OverrideAction:
+
+
+            None: {}
+
+
+          Statement:
+
+
+            ManagedRuleGroupStatement:
+
+
+              VendorName: AWS
+
+
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+
+
+          VisibilityConfig:
+
+
+            CloudWatchMetricsEnabled: true
+
+
+            MetricName: KnownBadInputsMetric
+
+
+            SampledRequestsEnabled: true
+
+
+
+
+
+        # AWS Managed Rules: SQL Injection
+
+
+        - Name: AWSManagedRulesSQLiRuleSet
+
+
+          Priority: 4
+
+
+          OverrideAction:
+
+
+            None: {}
+
+
+          Statement:
+
+
+            ManagedRuleGroupStatement:
+
+
+              VendorName: AWS
+
+
+              Name: AWSManagedRulesSQLiRuleSet
+
+
+          VisibilityConfig:
+
+
+            CloudWatchMetricsEnabled: true
+
+
+            MetricName: SQLiRuleSetMetric
+
+
+            SampledRequestsEnabled: true
+
+
+
+
+
+  # Note: WAF WebACL Association to API Gateway stage is done
+
+
+  # post-deploy via CLI, since SAM manages the stage lifecycle:
+
+
+
+
+
+  # =========================================================================
+
+
+  # 7. IoT CORE  Thing, Certificate Policy, Topic Rules
+
+
+  # =========================================================================
+
+
+
+
+
+  IoTPolicy:
+
+
+    Type: AWS::IoT::Policy
+
+
+    Properties:
+
+
+      PolicyName: !Sub "${ProjectName}-device-policy-${Environment}"
+
+
+      PolicyDocument:
+
+
+        Version: "2012-10-17"
+
+
+        Statement:
+
+
+          - Effect: Allow
+
+
+            Action:
+
+
+              - iot:Connect
+
+
+            Resource:
+
+
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-*"
+
+
+          - Effect: Allow
+
+
+            Action:
+
+
+              - iot:Publish
+
+
+            Resource:
+
+
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/recognize"
+
+
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/status"
+
+
+          - Effect: Allow
+
+
+            Action:
+
+
+              - iot:Subscribe
+
+
+            Resource:
+
+
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/marrty/*/result"
+
+
+          - Effect: Allow
+
+
+            Action:
+
+
+              - iot:Receive
+
+
+            Resource:
+
+
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/result"
+
+
+
+
+
+  # IoT Rule: Route face recognition requests to Lambda
+
+
+  IoTRecognizeRule:
+
+
+    Type: AWS::IoT::TopicRule
+
+
+    Properties:
+
+
+      RuleName: "marrty_ifr31_recognize_rule_dev"
+
+
+      TopicRulePayload:
+
+
+        RuleDisabled: false
+
+
+        Sql: "SELECT *, topic(2) AS device_id FROM 'marrty/+/recognize'"
+
+
+        Actions:
+
+
+          - Lambda:
+
+
+              FunctionArn: !GetAtt RecognizeFaceFunction.Arn
+
+
+        ErrorAction:
+
+
+          CloudwatchLogs:
+
+
+            LogGroupName: !Sub "/aws/iot/${ProjectName}-errors-${Environment}"
+
+
+            RoleArn: !GetAtt IoTRuleRole.Arn
+
+
+
+
+
+  IoTRuleRole:
+
+
+    Type: AWS::IAM::Role
+
+
+    Properties:
+
+
+      RoleName: !Sub "${ProjectName}-iot-rule-role-${Environment}"
+
+
+      AssumeRolePolicyDocument:
+
+
+        Version: "2012-10-17"
+
+
+        Statement:
+
+
+          - Effect: Allow
+
+
+            Principal:
+
+
+              Service: iot.amazonaws.com
+
+
+            Action: sts:AssumeRole
+
+
+      Policies:
+
+
+        - PolicyName: IoTRuleCloudWatchLogs
+
+
+          PolicyDocument:
+
+
+            Version: "2012-10-17"
+
+
+            Statement:
+
+
+              - Effect: Allow
+
+
+                Action:
+
+
+                  - logs:CreateLogGroup
+
+
+                  - logs:CreateLogStream
+
+
+                  - logs:PutLogEvents
+
+
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/iot/*"
+
+
+
+
+
+  # Permission for IoT to invoke Lambda
+
+
+  RecognizeFunctionIoTPermission:
+
+
+    Type: AWS::Lambda::Permission
+
+
+    Properties:
+
+
+      FunctionName: !Ref RecognizeFaceFunction
+
+
+      Action: lambda:InvokeFunction
+
+
+      Principal: iot.amazonaws.com
+
+
+      SourceArn: !GetAtt IoTRecognizeRule.Arn
+
+
+
+
+
+  # =========================================================================
+
+
+  # 8. LAMBDA FUNCTIONS
+
+
+  # =========================================================================
+
+
+
+
+
+  # --- Recognize Face (IoT Triggered) ---
+
+
+  RecognizeFaceFunction:
+
+
+    Type: AWS::Serverless::Function
+
+
+    Properties:
+
+
+      FunctionName: !Sub "${ProjectName}-recognize-face-${Environment}"
+
+
+      Description: "Recognize face from IoT device, log attendance"
+
+
+      CodeUri: ../marrty-ifr31-recognize/src/
+
+
+      Handler: handler.lambda_handler
+
+
+      Timeout: 15
+
+
+      MemorySize: 512
+
+
+      Policies:
+
+
+        - Version: "2012-10-17"
+
+
+          Statement:
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - rekognition:SearchFacesByImage
+
+
+              Resource: !Sub "arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/${ProjectName}-students-${Environment}"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - dynamodb:GetItem
+
+
+                - dynamodb:Query
+
+
+              Resource:
+
+
+                - !GetAtt StudentsTable.Arn
+
+
+                - !Sub "${StudentsTable.Arn}/index/*"
+
+
+                - !GetAtt FacultyTable.Arn
+
+
+                - !Sub "${FacultyTable.Arn}/index/*"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - dynamodb:PutItem
+
+
+              Resource: !GetAtt AttendanceTable.Arn
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - iot:Publish
+
+
+              Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/marrty/*/result"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - kms:Decrypt
+
+
+                - kms:Encrypt
+
+
+                - kms:GenerateDataKey
+
+
+              Resource: !GetAtt MasterEncryptionKey.Arn
+
+
+      Environment:
+
+
+        Variables:
+
+
+          IOT_ENDPOINT: !Sub "${ProjectName}-iot-endpoint"
+
+
+
+
+
+  # --- Enroll Face (API Gateway) ---
+
+
+  EnrollFaceFunction:
+
+
+    Type: AWS::Serverless::Function
+
+
+    Properties:
+
+
+      FunctionName: !Sub "${ProjectName}-enroll-face-${Environment}"
+
+
+      Description: "Upload photos and index faces into Rekognition"
+
+
+      CodeUri: ../marrty-ifr31-enroll/src/
+
+
+      Handler: handler.lambda_handler
+
+
+      Timeout: 30
+
+
+      MemorySize: 512
+
+
+      Policies:
+
+
+        - Version: "2012-10-17"
+
+
+          Statement:
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - s3:PutObject
+
+
+                - s3:GetObject
+
+
+                - s3:DeleteObject
+
+
+              Resource: !Sub "${FaceImagesBucket.Arn}/*"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - rekognition:IndexFaces
+
+
+                - rekognition:DeleteFaces
+
+
+                - rekognition:ListFaces
+
+
+                - rekognition:DescribeCollection
+
+
+                - rekognition:CreateCollection
+
+
+              Resource: !Sub "arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/${ProjectName}-students-${Environment}"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - dynamodb:UpdateItem
+
+
+                - dynamodb:GetItem
+
+
+              Resource:
+
+
+                - !GetAtt StudentsTable.Arn
+
+
+                - !GetAtt FacultyTable.Arn
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - kms:Decrypt
+
+
+                - kms:Encrypt
+
+
+                - kms:GenerateDataKey
+
+
+              Resource: !GetAtt MasterEncryptionKey.Arn
+
+
+      Events:
+
+
+        EnrollPhotos:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/enroll/{person_id}
+
+
+            Method: POST
+
+
+        DeleteFaces:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/enroll/{person_id}
+
+
+            Method: DELETE
+
+
+
+
+
+  # --- Student API (CRUD) ---
+
+
+  StudentApiFunction:
+
+
+    Type: AWS::Serverless::Function
+
+
+    Properties:
+
+
+      FunctionName: !Sub "${ProjectName}-student-api-${Environment}"
+
+
+      Description: "Student CRUD operations"
+
+
+      CodeUri: ../marrty-ifr31-student-api/src/
+
+
+      Handler: handler.lambda_handler
+
+
+      Policies:
+
+
+        - Version: "2012-10-17"
+
+
+          Statement:
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - dynamodb:PutItem
+
+
+                - dynamodb:GetItem
+
+
+                - dynamodb:UpdateItem
+
+
+                - dynamodb:DeleteItem
+
+
+                - dynamodb:Query
+
+
+                - dynamodb:Scan
+
+
+              Resource:
+
+
+                - !GetAtt StudentsTable.Arn
+
+
+                - !Sub "${StudentsTable.Arn}/index/*"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - kms:Decrypt
+
+
+                - kms:Encrypt
+
+
+                - kms:GenerateDataKey
+
+
+              Resource: !GetAtt MasterEncryptionKey.Arn
+
+
+      Events:
+
+
+        CreateStudent:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/students
+
+
+            Method: POST
+
+
+        ListStudents:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/students
+
+
+            Method: GET
+
+
+        GetStudent:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/students/{id}
+
+
+            Method: GET
+
+
+        UpdateStudent:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/students/{id}
+
+
+            Method: PUT
+
+
+        DeleteStudent:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/students/{id}
+
+
+            Method: DELETE
+
+
+
+
+
+  # --- Faculty API (CRUD) ---
+
+
+  FacultyApiFunction:
+
+
+    Type: AWS::Serverless::Function
+
+
+    Properties:
+
+
+      FunctionName: !Sub "${ProjectName}-faculty-api-${Environment}"
+
+
+      Description: "Faculty CRUD operations"
+
+
+      CodeUri: ../marrty-ifr31-faculty-api/src/
+
+
+      Handler: handler.lambda_handler
+
+
+      Policies:
+
+
+        - Version: "2012-10-17"
+
+
+          Statement:
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - dynamodb:PutItem
+
+
+                - dynamodb:GetItem
+
+
+                - dynamodb:UpdateItem
+
+
+                - dynamodb:DeleteItem
+
+
+                - dynamodb:Query
+
+
+                - dynamodb:Scan
+
+
+              Resource:
+
+
+                - !GetAtt FacultyTable.Arn
+
+
+                - !Sub "${FacultyTable.Arn}/index/*"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - kms:Decrypt
+
+
+                - kms:Encrypt
+
+
+                - kms:GenerateDataKey
+
+
+              Resource: !GetAtt MasterEncryptionKey.Arn
+
+
+      Events:
+
+
+        CreateFaculty:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/faculty
+
+
+            Method: POST
+
+
+        ListFaculty:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/faculty
+
+
+            Method: GET
+
+
+        GetFaculty:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/faculty/{id}
+
+
+            Method: GET
+
+
+        UpdateFaculty:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/faculty/{id}
+
+
+            Method: PUT
+
+
+        DeleteFaculty:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/faculty/{id}
+
+
+            Method: DELETE
+
+
+
+
+
+  # --- Attendance API (Query & Reports) ---
+
+
+  AttendanceApiFunction:
+
+
+    Type: AWS::Serverless::Function
+
+
+    Properties:
+
+
+      FunctionName: !Sub "${ProjectName}-attendance-api-${Environment}"
+
+
+      Description: "Attendance query and reports"
+
+
+      CodeUri: ../marrty-ifr31-attendance/src/
+
+
+      Handler: handler.lambda_handler
+
+
+      Policies:
+
+
+        - Version: "2012-10-17"
+
+
+          Statement:
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - dynamodb:GetItem
+
+
+                - dynamodb:Query
+
+
+                - dynamodb:Scan
+
+
+              Resource:
+
+
+                - !GetAtt AttendanceTable.Arn
+
+
+                - !Sub "${AttendanceTable.Arn}/index/*"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - dynamodb:GetItem
+
+
+                - dynamodb:Query
+
+
+              Resource:
+
+
+                - !GetAtt StudentsTable.Arn
+
+
+                - !Sub "${StudentsTable.Arn}/index/*"
+
+
+            - Effect: Allow
+
+
+              Action:
+
+
+                - kms:Decrypt
+
+
+                - kms:GenerateDataKey
+
+
+              Resource: !GetAtt MasterEncryptionKey.Arn
+
+
+      Events:
+
+
+        GetAttendance:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/attendance
+
+
+            Method: GET
+
+
+        GetAttendanceReport:
+
+
+          Type: Api
+
+
+          Properties:
+
+
+            RestApiId: !Ref MarrtyApi
+
+
+            Path: /api/attendance/report
+
+
+            Method: GET
+
+
+
+
+
+  # =========================================================================
+
+
+  # 9. CLOUDWATCH LOG GROUPS (Encrypted)
+
+
+  # =========================================================================
+
+
+
+
+
+  RecognizeFaceLogGroup:
+
+
+    Type: AWS::Logs::LogGroup
+
+
+    Properties:
+
+
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-recognize-face-${Environment}"
+
+
+      RetentionInDays: 30
+
+
+      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
+
+
+
+
+
+  EnrollFaceLogGroup:
+
+
+    Type: AWS::Logs::LogGroup
+
+
+    Properties:
+
+
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-enroll-face-${Environment}"
+
+
+      RetentionInDays: 30
+
+
+      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
+
+
+
+
+
+  StudentApiLogGroup:
+
+
+    Type: AWS::Logs::LogGroup
+
+
+    Properties:
+
+
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-student-api-${Environment}"
+
+
+      RetentionInDays: 30
+
+
+      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
+
+
+
+
+
+  FacultyApiLogGroup:
+
+
+    Type: AWS::Logs::LogGroup
+
+
+    Properties:
+
+
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-faculty-api-${Environment}"
+
+
+      RetentionInDays: 30
+
+
+      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
+
+
+
+
+
+  AttendanceApiLogGroup:
+
+
+    Type: AWS::Logs::LogGroup
+
+
+    Properties:
+
+
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-attendance-api-${Environment}"
+
+
+      RetentionInDays: 30
+
+
+      KmsKeyId: !GetAtt MasterEncryptionKey.Arn
+
+
+
+
+
+  IoTErrorLogGroup:
+
+
+    Type: AWS::Logs::LogGroup
+
+
+    Properties:
+
+
+      LogGroupName: !Sub "/aws/iot/${ProjectName}-errors-${Environment}"
+
+
+      RetentionInDays: 30
+
+
+
+
+
+
+
+
+  # =========================================================================
+
+
+  # 9. FRONTEND HOSTING  S3 + CloudFront
+
+
+  # =========================================================================
+
+
+
+
+
+  FrontendBucket:
+
+
+    Type: AWS::S3::Bucket
+
+
+    Properties:
+
+
+      BucketName: !Sub "${ProjectName}-web-${Environment}-${AWS::AccountId}"
+
+
+      PublicAccessBlockConfiguration:
+
+
+        BlockPublicAcls: true
+
+
+        BlockPublicPolicy: true
+
+
+        IgnorePublicAcls: true
+
+
+        RestrictPublicBuckets: true
+
+
+      VersioningConfiguration:
+
+
+        Status: Enabled
+
+
+      BucketEncryption:
+
+
+        ServerSideEncryptionConfiguration:
+
+
+          - ServerSideEncryptionByDefault:
+
+
+              SSEAlgorithm: AES256
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  FrontendOAC:
+
+
+    Type: AWS::CloudFront::OriginAccessControl
+
+
+    Properties:
+
+
+      OriginAccessControlConfig:
+
+
+        Name: !Sub "${ProjectName}-oac-${Environment}"
+
+
+        OriginAccessControlOriginType: s3
+
+
+        SigningBehavior: always
+
+
+        SigningProtocol: sigv4
+
+
+        Description: "OAC for S3 frontend bucket"
+
+
+
+
+
+  FrontendDistribution:
+
+
+    Type: AWS::CloudFront::Distribution
+
+
+    Properties:
+
+
+      DistributionConfig:
+
+
+        Enabled: true
+
+
+        DefaultRootObject: index.html
+
+
+        Origins:
+
+
+          - Id: S3Origin
+
+
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+
+
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+
+
+            S3OriginConfig:
+
+
+              OriginAccessIdentity: ""
+
+
+        DefaultCacheBehavior:
+
+
+          TargetOriginId: S3Origin
+
+
+          ViewerProtocolPolicy: redirect-to-https
+
+
+          AllowedMethods: [GET, HEAD, OPTIONS]
+
+
+          CachedMethods: [GET, HEAD]
+
+
+          Compress: true
+
+
+          ForwardedValues:
+
+
+            QueryString: false
+
+
+            Cookies:
+
+
+              Forward: none
+
+
+        CustomErrorResponses:
+
+
+          - ErrorCode: 403
+
+
+            ResponseCode: 200
+
+
+            ResponsePagePath: /index.html
+
+
+          - ErrorCode: 404
+
+
+            ResponseCode: 200
+
+
+            ResponsePagePath: /index.html
+
+
+        ViewerCertificate:
+
+
+          CloudFrontDefaultCertificate: true
+
+
+      Tags:
+
+
+        - Key: Project
+
+
+          Value: !Ref ProjectName
+
+
+
+
+
+  FrontendBucketPolicy:
+
+
+    Type: AWS::S3::BucketPolicy
+
+
+    Properties:
+
+
+      Bucket: !Ref FrontendBucket
+
+
+      PolicyDocument:
+
+
+        Version: "2012-10-17"
+
+
+        Statement:
+
+
+          - Sid: AllowCloudFrontServicePrincipal
+
+
+            Effect: Allow
+
+
+            Principal:
+
+
+              Service: cloudfront.amazonaws.com
+
+
+            Action: s3:GetObject
+
+
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+
+            Condition:
+
+
+              StringEquals:
+
+
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution.Id}"
+
+
+
+
+
+Outputs:
+
+
+  ApiUrl:
+
+
+    Description: "API Gateway endpoint URL"
+
+
+    Value: !Sub "https://${MarrtyApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+
+
+
+
+
+  UserPoolId:
+
+
+    Description: "Cognito User Pool ID"
+
+
+    Value: !Ref UserPool
+
+
+
+
+
+  UserPoolClientId:
+
+
+    Description: "Cognito User Pool Client ID"
+
+
+    Value: !Ref UserPoolClient
+
+
+
+
+
+  FrontendUrl:
+
+
+    Description: "CloudFront Distribution URL"
+
+
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+
+
+
+
+
+  FrontendBucketName:
+
+
+    Description: "S3 Bucket for frontend hosting"
+
+
+    Value: !Ref FrontendBucket
+
+
+
+
+
+  FaceImagesBucketName:
+
+
+    Description: "S3 Bucket for face images"
+
+
+    Value: !Ref FaceImagesBucket
+
+
+
+
+
+  RekognitionCollectionId:
+
+
+    Description: "Rekognition face collection ID"
+
+
+    Value: !Sub "${ProjectName}-students-${Environment}"
+
+
+
+
+
+  DevicesTableName:
+
+
+    Description: "DynamoDB Devices table"
+
+
+    Value: !Ref DevicesTable
+
+
+
+
+
+  StudentsTableName:
+
+
+    Description: "DynamoDB Students table"
+
+
+    Value: !Ref StudentsTable
+
+
+
+
+
+  IoTPolicyName:
+
+
+    Description: "IoT device policy name"
+
+
+    Value: !Ref IoTPolicy
+
+

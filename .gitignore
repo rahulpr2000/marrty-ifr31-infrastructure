@@ -1,0 +1,19 @@
+# Dependencies
+.aws-sam/
+node_modules/
+__pycache__/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SAM
+packaged.yaml

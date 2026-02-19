@@ -1,0 +1,17 @@
+# SAM deployment configuration
+# Marrty IFR31 Infrastructure
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "marrty-ifr31-dev"
+region = "ap-south-1"
+resolve_s3 = true
+s3_prefix = "marrty-ifr31-dev"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=dev ProjectName=marrty-ifr31"
+tags = "Project=marrty-ifr31 Environment=dev"
+
+[default.build.parameters]
+use_container = false
